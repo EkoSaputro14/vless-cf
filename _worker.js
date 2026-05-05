@@ -16,6 +16,14 @@ let พร็อกซีไอพี = พร็อกซีไอพีs[Math.
 
 let dohURL = 'https://freedns.controld.com/p0'; // https://github.com/serverless-dns/serverless-dns OR xxx.xxx.workers.dev [README.md]
 
+// DNS relay settings: when ENABLE_DNS_RELAY is true (default), UDP DNS queries (port 53)
+// are forwarded to DNS_SERVER_ADDRESS:DNS_SERVER_PORT via a DNS-over-TCP connection
+// instead of the DoH (DNS-over-HTTPS) fallback. This improves reliability when DoH
+// endpoints are blocked, and mirrors the DNS-relay approach used by similar Workers.
+let dnsServerAddress = '1.1.1.1';
+let dnsServerPort = 53;
+let enableDnsRelay = true;
+
 if (!isValidUUID(userID)) {
 	throw new Error('uuid is invalid');
 }
@@ -23,7 +31,7 @@ if (!isValidUUID(userID)) {
 export default {
 	/**
 	 * @param {import("@cloudflare/workers-types").Request} request
-	 * @param {{UUID: string, พร็อกซีไอพี: string, DNS_RESOLVER_URL: string, NODE_ID: int, API_HOST: string, API_TOKEN: string}} env
+	 * @param {{UUID: string, พร็อกซีไอพี: string, DNS_RESOLVER_URL: string, DNS_SERVER_ADDRESS: string, DNS_SERVER_PORT: string, ENABLE_DNS_RELAY: string, NODE_ID: int, API_HOST: string, API_TOKEN: string}} env
 	 * @param {import("@cloudflare/workers-types").ExecutionContext} ctx
 	 * @returns {Promise<Response>}
 	 */
@@ -33,6 +41,11 @@ export default {
 			userID = env.UUID || userID;
 			พร็อกซีไอพี = env.พร็อกซีไอพี || พร็อกซีไอพี;
 			dohURL = env.DNS_RESOLVER_URL || dohURL;
+			dnsServerAddress = env.DNS_SERVER_ADDRESS || dnsServerAddress;
+			dnsServerPort = parseInt(env.DNS_SERVER_PORT, 10) || dnsServerPort;
+			if (env.ENABLE_DNS_RELAY !== undefined) {
+				enableDnsRelay = env.ENABLE_DNS_RELAY.toLowerCase() !== 'false';
+			}
 			let userID_Path = userID;
 			if (userID.includes(',')) {
 				userID_Path = userID.split(',')[0];
@@ -210,9 +223,9 @@ async function วเลสOverWSHandler(request) {
 			const วเลสResponseHeader = new Uint8Array([วเลสVersion[0], 0]);
 			const rawClientData = chunk.slice(rawDataIndex);
 
-			// TODO: support udp here when cf runtime has udp support
+			// DNS relay: forward UDP port-53 queries via direct TCP or DoH
 			if (isDns) {
-				const { write } = await handleUDPOutBound(webSocket, วเลสResponseHeader, log);
+				const { write } = await handleUDPOutBound(webSocket, วเลสResponseHeader, log, enableDnsRelay, dnsServerAddress, dnsServerPort);
 				udpStreamWrite = write;
 				udpStreamWrite(rawClientData);
 				return;
@@ -617,13 +630,69 @@ function stringify(arr, offset = 0) {
 
 
 /**
+ * Resolves a raw DNS message by sending it over a DNS-over-TCP connection.
+ * Used as a direct relay alternative to DoH when ENABLE_DNS_RELAY is true.
+ * @param {Uint8Array} rawDnsMsg The raw DNS query message (without any length prefix).
+ * @param {string} serverAddress The DNS server address (e.g. "1.1.1.1").
+ * @param {number} serverPort The DNS server port (e.g. 53).
+ * @returns {Promise<ArrayBuffer>} The raw DNS response message (without the TCP length prefix).
+ */
+async function dnsQueryViaTCP(rawDnsMsg, serverAddress, serverPort) {
+	// DNS-over-TCP prepends a 2-byte big-endian message length
+	const tcpMsg = new Uint8Array(2 + rawDnsMsg.byteLength);
+	tcpMsg[0] = (rawDnsMsg.byteLength >> 8) & 0xff;
+	tcpMsg[1] = rawDnsMsg.byteLength & 0xff;
+	tcpMsg.set(rawDnsMsg, 2);
+
+	const tcpSocket = connect({ hostname: serverAddress, port: serverPort });
+	const writer = tcpSocket.writable.getWriter();
+	await writer.write(tcpMsg);
+	writer.releaseLock();
+
+	// Read until we have a complete DNS-over-TCP response (2-byte length + message)
+	const reader = tcpSocket.readable.getReader();
+	let buf = new Uint8Array(0);
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			const tmp = new Uint8Array(buf.byteLength + value.byteLength);
+			tmp.set(buf);
+			tmp.set(value, buf.byteLength);
+			buf = tmp;
+			if (buf.byteLength >= 2) {
+				const respLen = (buf[0] << 8) | buf[1];
+				if (buf.byteLength >= 2 + respLen) break;
+			}
+		}
+	} finally {
+		reader.releaseLock();
+		tcpSocket.close().catch((err) => {
+			// best-effort close; log for debugging
+			console.log('dnsQueryViaTCP: socket close error', err);
+		});
+	}
+
+	if (buf.byteLength < 2) {
+		throw new Error('DNS relay: empty response from server');
+	}
+	// Strip the 2-byte TCP length prefix and return the raw DNS response
+	return buf.slice(2).buffer;
+}
+
+/**
  * Handles outbound UDP traffic by transforming the data into DNS queries and sending them over a WebSocket connection.
+ * When useDirectRelay is true, queries are forwarded to dnsAddr:dnsPort via DNS-over-TCP.
+ * When useDirectRelay is false, queries are forwarded via DNS-over-HTTPS (DoH) using dohURL.
  * @param {import("@cloudflare/workers-types").WebSocket} webSocket The WebSocket connection to send the DNS queries over.
  * @param {ArrayBuffer} วเลสResponseHeader The วเลส response header.
  * @param {(string) => void} log The logging function.
+ * @param {boolean} useDirectRelay When true, use DNS-over-TCP relay; when false, use DoH.
+ * @param {string} dnsAddr The DNS server address for direct relay (e.g. "1.1.1.1").
+ * @param {number} dnsPort The DNS server port for direct relay (e.g. 53).
  * @returns {{write: (chunk: Uint8Array) => void}} An object with a write method that accepts a Uint8Array chunk to write to the transform stream.
  */
-async function handleUDPOutBound(webSocket, วเลสResponseHeader, log) {
+async function handleUDPOutBound(webSocket, วเลสResponseHeader, log, useDirectRelay = false, dnsAddr = '1.1.1.1', dnsPort = 53) {
 
 	let isวเลสHeaderSent = false;
 	const transformStream = new TransformStream({
@@ -650,20 +719,26 @@ async function handleUDPOutBound(webSocket, วเลสResponseHeader, log) {
 	// only handle dns udp for now
 	transformStream.readable.pipeTo(new WritableStream({
 		async write(chunk) {
-			const resp = await fetch(dohURL, // dns server url
-				{
+			let dnsQueryResult;
+			if (useDirectRelay) {
+				// Direct DNS relay: forward to dnsAddr:dnsPort via DNS-over-TCP
+				dnsQueryResult = await dnsQueryViaTCP(chunk, dnsAddr, dnsPort);
+				log(`dns relay success, response length is ${dnsQueryResult.byteLength}`);
+			} else {
+				// DoH fallback
+				const resp = await fetch(dohURL, {
 					method: 'POST',
 					headers: {
 						'content-type': 'application/dns-message',
 					},
 					body: chunk,
-				})
-			const dnsQueryResult = await resp.arrayBuffer();
+				});
+				dnsQueryResult = await resp.arrayBuffer();
+				log(`doh success and dns message length is ${dnsQueryResult.byteLength}`);
+			}
 			const udpSize = dnsQueryResult.byteLength;
-			// console.log([...new Uint8Array(dnsQueryResult)].map((x) => x.toString(16)));
 			const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
 			if (webSocket.readyState === WS_READY_STATE_OPEN) {
-				log(`doh success and dns message length is ${udpSize}`);
 				if (isวเลสHeaderSent) {
 					webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
 				} else {
@@ -699,7 +774,7 @@ const ed = 'RUR0dW5uZWw=';
  * @returns {string}
  */
 function getวเลสConfig(userIDs, hostName) {
-	const commonUrlPart = `:443?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
+	const commonUrlPart = `:443?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2Fws#${hostName}`;
 	const hashSeparator = "################################################################";
 
 	// Split the userIDs into an array
@@ -835,8 +910,8 @@ const เซ็ตพอร์ตHttps = new Set([443, 8443, 2053, 2096, 2087, 2
 
 function สร้างวเลสSub(ไอดีผู้ใช้_เส้นทาง, ชื่อโฮสต์) {
 	const อาร์เรย์ไอดีผู้ใช้ = ไอดีผู้ใช้_เส้นทาง.includes(',') ? ไอดีผู้ใช้_เส้นทาง.split(',') : [ไอดีผู้ใช้_เส้นทาง];
-	const ส่วนUrlทั่วไปHttp = `?encryption=none&security=none&fp=random&type=ws&host=${ชื่อโฮสต์}&path=%2F%3Fed%3D2048#`;
-	const ส่วนUrlทั่วไปHttps = `?encryption=none&security=tls&sni=${ชื่อโฮสต์}&fp=random&type=ws&host=${ชื่อโฮสต์}&path=%2F%3Fed%3D2048#`;
+	const ส่วนUrlทั่วไปHttp = `?encryption=none&security=none&fp=random&type=ws&host=${ชื่อโฮสต์}&path=%2Fws#`;
+	const ส่วนUrlทั่วไปHttps = `?encryption=none&security=tls&sni=${ชื่อโฮสต์}&fp=random&type=ws&host=${ชื่อโฮสต์}&path=%2Fws#`;
 
 	const ผลลัพธ์ = อาร์เรย์ไอดีผู้ใช้.flatMap((ไอดีผู้ใช้) => {
 		const การกำหนดค่าHttp = Array.from(เซ็ตพอร์ตHttp).flatMap((พอร์ต) => {

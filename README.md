@@ -14,6 +14,76 @@ Use Cloudflare pages and worker serverless to implement VLESS protocol.
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Vauth/vless-cf)
 
 
+## DNS Relay (fixes `dns: exchange failed … EOF` errors)
+
+### What causes the EOF error?
+When a VLESS client (e.g. v2rayN) uses a built-in DNS module to resolve domain names
+through the proxy, it typically sends UDP DNS queries (port 53) inside the VLESS/WebSocket
+tunnel. If the Worker cannot forward those queries — for example because the configured
+DNS-over-HTTPS (DoH) endpoint is blocked — the client gets an immediate connection close
+(`EOF`) and cannot browse any website even though the tunnel itself is active.
+
+### How the DNS relay works
+This Worker intercepts those UDP port-53 queries inside the tunnel and forwards each DNS
+message to a configurable upstream DNS server using a **DNS-over-TCP** connection (TCP
+connects to port 53 on the DNS server). This avoids dependence on DoH endpoints and
+typically resolves the EOF error.
+
+### DNS relay environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_DNS_RELAY` | `true` | Set to `false` to fall back to DoH instead of direct relay. |
+| `DNS_SERVER_ADDRESS` | `1.1.1.1` | IP/hostname of the upstream DNS server for direct relay. |
+| `DNS_SERVER_PORT` | `53` | Port of the upstream DNS server. |
+| `DNS_RESOLVER_URL` | `https://freedns.controld.com/p0` | DoH URL used only when `ENABLE_DNS_RELAY` is `false`. |
+
+#### How to set env vars in Cloudflare
+
+**Workers (dashboard)**:
+1. Open your Worker → **Settings** → **Variables**.
+2. Under *Environment Variables*, click **Add variable**.
+3. Add `DNS_SERVER_ADDRESS`, `DNS_SERVER_PORT`, and/or `ENABLE_DNS_RELAY` with the values
+   you want, then click **Save and deploy**.
+
+**Workers (wrangler.toml)**:
+```toml
+[vars]
+DNS_SERVER_ADDRESS = "1.1.1.1"
+DNS_SERVER_PORT    = "53"
+ENABLE_DNS_RELAY   = "true"
+```
+
+**Pages**:
+1. Open your Pages project → **Settings** → **Environment variables**.
+2. Add the variables under *Production* (and optionally *Preview*) and click **Save**.
+
+### Recommended v2rayN DNS settings
+
+Open **Settings → DNS Settings** and configure:
+
+| Setting | Recommended value |
+|---|---|
+| Bootstrap DNS | `1.1.1.1` (or `8.8.8.8`) |
+| Remote DNS (DoH) | `https://cloudflare-dns.com/dns-query` |
+| Domestic DNS | `https://cloudflare-dns.com/dns-query` |
+
+If you still get EOF errors, try **disabling custom DNS** in v2rayN and let the operating
+system handle DNS resolution (select *Use system DNS* or clear the custom DNS fields).
+
+## WebSocket path
+
+The Worker accepts WebSocket upgrade requests on **any** path. The subscription generator
+(`/sub/<uuid>`) and the config page (`/<uuid>`) both output `/ws` as the WebSocket path,
+which is the value to use in client configuration:
+
+```
+WS Path: /ws
+```
+
+Make sure your v2rayN / Clash profile uses `/ws` (with the leading slash) and **not** `ws`
+(without a slash) or `/?ed=2048`.
+
 ## DoH with Cloudflare
 1. Follow the https://github.com/serverless-dns/serverless-dns .
 2. Replace the dns url with `dohURL` value in `_worker.js` .
